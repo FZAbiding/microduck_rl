@@ -4710,6 +4710,11 @@ class VelocityCommandCommandOnly(UniformVelocityCommand):
 
     def _resample_command(self, env_ids: torch.Tensor) -> None:
         super()._resample_command(env_ids)
+        zero_prob = getattr(self.cfg, "zero_command_prob", 0.0)
+        if zero_prob > 0.0 and len(env_ids) > 0:
+            zero = torch.rand(len(env_ids), device=self.device) < zero_prob
+            self.vel_command_b[env_ids[zero]] = 0.0
+            self.vel_command_w[env_ids[zero]] = 0.0
         # Turn-in-place practice: for a fraction of envs, zero the linear velocity
         # and force a meaningful (away-from-zero) yaw command. Independent uniform
         # sampling almost never produces "lin≈0, |ang| large" (~2% of samples), so
@@ -4771,6 +4776,7 @@ class VelocityCommandCommandOnlyCfg(UniformVelocityCommandCfg):
     # Fraction of envs commanded to turn in place (lin=0, |ang| forced to
     # [0.4·max, max]) each resample. 0 = disabled (base uniform sampling only).
     rel_turn_in_place_envs: float = 0.0
+    zero_command_prob: float = 0.0
 
     def build(self, env: ManagerBasedRlEnv) -> "VelocityCommandCommandOnly":
         return VelocityCommandCommandOnly(self, env)
@@ -7389,3 +7395,527 @@ def roulade_lateral_velocity_penalty(
     """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
+
+
+# --------------------------------------------------------------------------- #
+# Jump task                                                                    #
+# --------------------------------------------------------------------------- #
+
+def _jump_trunk_height(env: ManagerBasedRlEnv, asset: Entity) -> torch.Tensor:
+    origin = getattr(getattr(env.scene, "terrain", None), "env_origins", 0.0)
+    origin_z = origin[:, 2] if isinstance(origin, torch.Tensor) else 0.0
+    return torch.nan_to_num(asset.data.root_link_pos_w[:, 2] - origin_z, nan=0.0)
+
+
+def _jump_feet_contact(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
+    if sensor_name not in env.scene.sensors:
+        return torch.zeros(env.num_envs, 2, dtype=torch.bool, device=env.device)
+    found = env.scene.sensors[sensor_name].data.found.reshape(env.num_envs, -1)
+    if found.shape[1] < 2:
+        found = torch.cat(
+            [found, torch.zeros(found.shape[0], 2 - found.shape[1],
+                                 device=found.device, dtype=found.dtype)],
+            dim=1,
+        )
+    return found[:, :2] > 0
+
+
+def _jump_any_contact(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
+    if sensor_name not in env.scene.sensors:
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    found = env.scene.sensors[sensor_name].data.found
+    return found.reshape(found.shape[0], -1).gt(0).any(dim=1)
+
+
+def _jump_foot_posture_errors(
+    env: ManagerBasedRlEnv,
+    asset: Entity,
+    asset_cfg: SceneEntityCfg | None = None,
+    side_slack_deg: float = 5.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return per-foot pitch error and excess roll error in radians.
+
+    Pitch is measured against world horizontal. Roll has a symmetric HOME
+    deadband, so a small edge load is allowed while a raised heel is visible.
+    """
+    if asset_cfg is None:
+        asset_cfg = SceneEntityCfg("robot", site_names=("left_foot", "right_foot"))
+    ids = getattr(asset_cfg, "site_ids", None)
+    if ids is None:
+        ids = [asset.site_names.index(n) for n in ("left_foot", "right_foot")]
+    q = asset.data.site_quat_w[:, ids, :]
+    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    roll = torch.atan2(2 * (w * x + y * z), 1 - 2 * (x.square() + y.square()))
+    pitch = torch.asin((2 * (w * y - z * x)).clamp(-1, 1))
+    pitch_error = pitch.abs()
+    roll_error = (roll.abs() - math.radians(side_slack_deg)).clamp_min(0.0)
+    return pitch_error, roll_error
+
+
+def jump_foot_pose_cost(
+    env: ManagerBasedRlEnv,
+    scale_rad: float = math.radians(3.0),
+    phase: str = "settle_hold",
+) -> torch.Tensor:
+    """Positive foot-flat cost; configure it with a negative reward weight."""
+    c = jump_v2_update(env)
+    pitch, roll = _jump_foot_posture_errors(env, env.scene["robot"])
+    error = torch.maximum(pitch, roll).amax(dim=-1)
+    cost = (error / max(scale_rad, 1e-6)).square()
+    return torch.where(c.phase_mask(phase), cost, torch.zeros_like(cost))
+
+
+def jump_robust_leg_home_cost(
+    env: ManagerBasedRlEnv,
+    scale_rad: float = 0.10,
+    phase: str = "settle_hold",
+) -> torch.Tensor:
+    """P4-style robust HOME cost, retaining the largest leg deviations."""
+    c = jump_v2_update(env)
+    asset = env.scene["robot"]
+    error = (_servo_joint_pos(env, asset) - _servo_default_joint_pos(env, asset)).abs()
+    legs = torch.stack((error[:, :5], error[:, 9:14]), dim=1)
+    p4 = (legs.pow(4).mean(dim=-1)).pow(0.25).amax(dim=-1)
+    cost = (p4 / max(scale_rad, 1e-6)).square()
+    return torch.where(c.phase_mask(phase), cost, torch.zeros_like(cost))
+
+
+def jump_touchdown_displacement_cost(
+    env: ManagerBasedRlEnv,
+    scale_m: float = 0.02,
+) -> torch.Tensor:
+    """One-shot touchdown drift cost, measured at first contact only."""
+    c = jump_v2_update(env)
+    position = env.scene["robot"].data.root_link_pos_w[:, :2]
+    error = (position - c.target_xy).norm(dim=-1) / max(scale_m, 1e-6)
+    cost = 4.0 * error.square() / (error.square() + 4.0)
+    return torch.where(c.impact > 0.0, cost, torch.zeros_like(cost))
+
+
+def jump_recovery_potential(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Potential-based recovery shaping: progress pays, static holding pays zero."""
+    c = jump_v2_update(env)
+    feet = _jump_feet_contact(env, "feet_ground_contact")
+    support = feet.all(dim=-1).float()
+    tilt = torch.exp(-(c.tilt / math.radians(15.0)).square())
+    speed = torch.exp(-(c.horizontal_speed / 0.15).square())
+    yaw = torch.exp(-(c.yaw_rate / 0.4).square())
+    legs = torch.exp(-(c.joint_l1 / 0.15).square())
+    foot = torch.exp(-((c.foot_pitch_max / math.radians(8.0)).square()
+                       + (c.foot_roll_max / math.radians(8.0)).square()))
+    potential = support * tilt * speed * yaw * legs * foot
+    if not hasattr(env, "_jump_recovery_potential"):
+        env._jump_recovery_potential = torch.zeros_like(potential)
+        env._jump_recovery_potential_valid = torch.zeros(
+            env.num_envs, dtype=torch.bool, device=env.device)
+    valid = c.settle_hold & ~c.invalid
+    fresh = valid & ~env._jump_recovery_potential_valid
+    env._jump_recovery_potential[fresh] = potential[fresh]
+    env._jump_recovery_potential_valid[~valid] = False
+    delta = potential - env._jump_recovery_potential
+    env._jump_recovery_potential[valid] = potential[valid]
+    env._jump_recovery_potential_valid[valid] = True
+    return torch.where(fresh | ~valid, torch.zeros_like(delta), delta) / env.step_dt
+
+
+def jump_settle_velocity_cost(env, **kwargs):
+    return jump_planar_velocity_cost(env, scale_m_s=0.03, phase="settle_hold")
+
+
+def jump_settle_yaw_rate_cost(env, **kwargs):
+    return jump_yaw_rate_cost(env, max_rate=0.1, phase="settle_hold")
+
+
+def jump_settle_upright_cost(env, **kwargs):
+    return jump_upright_cost(env, deadband_deg=0.0, cap_deg=15.0, phase="settle_hold")
+
+
+def jump_settle_heading_cost(env, **kwargs):
+    return jump_heading_error_cost(env, deadband_deg=0.0, cap_deg=10.0, phase="settle_hold")
+
+
+# Jump v2: command generation owns the request schedule; rewards observe the
+# shared controller before reset, using live manager parameters.
+def jump_controller(env):
+    from mjlab_microduck.jump_control import JumpController
+    if not hasattr(env, '_jump_controller'):
+        from mjlab_microduck.tasks.microduck_jump_env_cfg import STAND_Z
+        command_cfg = env.cfg.commands['twist']
+        env._jump_controller = JumpController(
+            env.num_envs, env.device, env.step_dt, stand_z=STAND_Z,
+            target_delta=float(getattr(command_cfg, 'target_delta', 0.015)),
+            required_delta=getattr(command_cfg, 'required_delta', None),
+            policy_version=int(getattr(command_cfg, 'policy_version', 3)),
+        )
+    return env._jump_controller
+
+
+def jump_v2_update(env):
+    c = jump_controller(env)
+    asset = env.scene['robot']
+    force = env.scene.sensors['feet_ground_contact'].data.force
+    force = force.reshape(env.num_envs, -1, 3).norm(dim=-1).sum(-1)
+    joint_finite = torch.isfinite(asset.data.joint_pos).all(-1) & torch.isfinite(asset.data.joint_vel).all(-1)
+    force = torch.where(joint_finite, force, torch.full_like(force, float('nan')))
+    servo_pos = _servo_joint_pos(env, asset)
+    servo_default = _servo_default_joint_pos(env, asset)
+    joint_error = servo_pos - servo_default
+    joint_l1 = joint_error.abs().mean(dim=-1)
+    foot_pitch_error, foot_roll_error = _jump_foot_posture_errors(env, asset)
+    horizontal_speed = asset.data.root_link_lin_vel_w[:, :2].norm(dim=-1)
+    c.update(int(env.common_step_counter), asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2],
+             asset.data.root_link_quat_w, asset.data.root_link_lin_vel_w[:, 2],
+             asset.data.root_link_ang_vel_b,
+             _jump_feet_contact(env, 'feet_ground_contact'),
+             _jump_any_contact(env, 'body_ground_contact'), force,
+             joint_l1=joint_l1, horizontal_speed=horizontal_speed,
+             joint_max=joint_error.abs().amax(dim=-1),
+             ankle_max=joint_error[:, (4, 9)].abs().amax(dim=-1),
+             foot_pitch_max=foot_pitch_error,
+             foot_roll_max=foot_roll_error)
+    return c
+
+
+def set_random_jump_recovery_state(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    z_center: float = 0.11581382155418396,
+) -> None:
+    """Sample a V8 reverse-curriculum recovery state near HOME."""
+    if env_ids is None or len(env_ids) == 0:
+        return
+    ids = env_ids.to(device=env.device, dtype=torch.long)
+    asset = env.scene[asset_cfg.name]
+    servo = _servo_joint_ids(env, asset)
+    joints = asset.data.default_joint_pos[ids].clone()
+    noise = (torch.rand((len(ids), len(servo)), device=env.device) * 2 - 1) * 0.12
+    joints[:, servo] += noise
+    names = tuple(asset.joint_names)
+    for name, magnitude in (("left_hip_pitch", .12), ("right_hip_pitch", .12),
+                            ("left_ankle", .06), ("right_ankle", .06)):
+        if name in names:
+            j = names.index(name)
+            sign = 1.0 if name.startswith("left_") else -1.0
+            joints[:, j] += sign * (torch.rand(len(ids), device=env.device) * 2 - 1) * magnitude
+    env.sim.data.qpos[ids, 7:] = joints
+    roll = (torch.rand(len(ids), device=env.device) * 2 - 1) * math.radians(8)
+    pitch = (torch.rand(len(ids), device=env.device) * 2 - 1) * math.radians(8)
+    yaw = (torch.rand(len(ids), device=env.device) * 2 - 1) * math.pi
+    cy, sy = torch.cos(yaw / 2), torch.sin(yaw / 2)
+    cp, sp = torch.cos(pitch / 2), torch.sin(pitch / 2)
+    cr, sr = torch.cos(roll / 2), torch.sin(roll / 2)
+    quat = torch.stack((cr*cp*cy + sr*sp*sy, sr*cp*cy - cr*sp*sy,
+                        cr*sp*cy + sr*cp*sy, cr*cp*sy - sr*sp*cy), dim=-1)
+    env.sim.data.qpos[ids, 2] = z_center + (torch.rand(len(ids), device=env.device) * 2 - 1) * .005
+    env.sim.data.qpos[ids, 3:7] = quat
+    env.sim.data.qvel[ids, 0:2] = (torch.rand((len(ids), 2), device=env.device) * 2 - 1) * .12
+    env.sim.data.qvel[ids, 3:6] = (torch.rand((len(ids), 3), device=env.device) * 2 - 1) * .5
+
+
+def jump_v8_reset(env, env_ids):
+    c = jump_controller(env)
+    c.reset(env_ids, int(env.common_step_counter))
+    command = env.command_manager.get_term("twist")
+    recovery = command.recovery_only[env_ids]
+    if recovery.any():
+        recovery_ids = env_ids[recovery]
+        set_random_jump_recovery_state(env, recovery_ids)
+        c.accepted[recovery_ids] = True
+        c.busy[recovery_ids] = True
+        c.took_off[recovery_ids] = True
+        c.landed[recovery_ids] = True
+        c.impact_paid[recovery_ids] = True
+        c.settle_hold[recovery_ids] = True
+    if hasattr(env, "_jump_head_bias_ema"):
+        env._jump_head_bias_ema[env_ids] = 0.0
+    if hasattr(env, "_jump_recovery_potential_valid"):
+        env._jump_recovery_potential_valid[env_ids] = False
+
+
+def jump_v2_reset(env, env_ids):
+    jump_controller(env).reset(env_ids, int(env.common_step_counter))
+    if hasattr(env, "_jump_head_bias_ema"):
+        env._jump_head_bias_ema[env_ids] = 0.0
+
+
+def jump_v2_reward(env, quantity: str):
+    return getattr(jump_v2_update(env), quantity).float().clone() / env.step_dt
+
+
+def jump_v2_standing_mask(env):
+    return env.command_manager.get_term('twist').standing_only.float().unsqueeze(-1)
+
+
+# Stable public names retained for reward configs, evaluation scripts and
+# downstream experiments. They all read the same one-update-per-step latches.
+def jump_height_progress(env, **kwargs):
+    return jump_v2_reward(env, 'height_progress')
+
+
+def jump_launch_velocity(env, **kwargs):
+    return jump_v2_reward(env, 'launch_signal')
+
+
+def jump_landing_impact(env, **kwargs):
+    return jump_v2_reward(env, 'impact')
+
+
+def jump_heading_error_cost(
+    env, deadband_deg: float = 3.0, cap_deg: float = 18.0,
+    phase: str = 'accepted', **kwargs
+):
+    """Bounded heading error cost, active only after a request is accepted."""
+    c = jump_v2_update(env)
+    excess = (c.heading_error.abs() - math.radians(deadband_deg)).clamp_min(0.0)
+    span = max(math.radians(cap_deg - deadband_deg), 1e-6)
+    return torch.where(
+        c.phase_mask(phase),
+        (excess / span).clamp(0.0, 1.0).square(),
+        torch.zeros_like(excess),
+    )
+
+
+def jump_yaw_rate_cost(env, max_rate: float = 2.0,
+                       phase: str = 'accepted', **kwargs):
+    """Bounded yaw-rate cost, active only after a request is accepted."""
+    c = jump_v2_update(env)
+    rate = (c.yaw_rate.abs() / max(max_rate, 1e-6)).clamp(0.0, 1.0)
+    return torch.where(c.phase_mask(phase), rate.square(), torch.zeros_like(rate))
+
+
+def jump_head_bias_penalty(env, tau_s: float = 1.0, **kwargs):
+    """Negative 1 s EMA L1 penalty for persistent zero-target head droop."""
+    asset = env.scene["robot"]
+    if not hasattr(env, "_jump_head_ids"):
+        ids, names = asset.find_joints_by_actuator_names(_NECK_JOINT_PATTERNS)
+        env._jump_head_ids = torch.tensor(ids, device=env.device, dtype=torch.long)
+        name_to_id = {n: i for i, n in enumerate(asset.joint_names)}
+        bl = [name_to_id.get(f"passive_{n}_backlash") for n in names]
+        env._jump_head_bl_ids = torch.tensor(
+            [0 if b is None else b for b in bl], device=env.device, dtype=torch.long
+        )
+        env._jump_head_bl_mask = torch.tensor(
+            [0.0 if b is None else 1.0 for b in bl], device=env.device
+        )
+    measured = (asset.data.joint_pos[:, env._jump_head_ids] +
+                asset.data.joint_pos[:, env._jump_head_bl_ids] * env._jump_head_bl_mask)
+    err = measured - asset.data.default_joint_pos[:, env._jump_head_ids]
+    if not hasattr(env, "_jump_head_bias_ema"):
+        env._jump_head_bias_ema = torch.zeros_like(err)
+    fresh = env.episode_length_buf <= 1
+    env._jump_head_bias_ema[fresh] = 0.0
+    alpha = min(1.0, float(env.step_dt) / max(tau_s, 1e-6))
+    env._jump_head_bias_ema = (1.0 - alpha) * env._jump_head_bias_ema + alpha * err
+    return torch.where(
+        jump_controller(env).accepted,
+        -env._jump_head_bias_ema.abs().mean(dim=-1),
+        torch.zeros(env.num_envs, device=env.device),
+    )
+
+
+def jump_planar_displacement_cost(
+    env, scale_m: float = 0.02, phase: str = 'accepted', **kwargs
+):
+    """Bounded squared distance from the position captured at jump request."""
+    c = jump_v2_update(env)
+    position = env.scene["robot"].data.root_link_pos_w[:, :2]
+    error = (position - c.target_xy).norm(dim=-1) / max(scale_m, 1e-6)
+    square = error.square()
+    cost = 4.0 * square / (square + 4.0)
+    return torch.where(c.phase_mask(phase), cost, torch.zeros_like(cost))
+
+
+def jump_planar_velocity_cost(
+    env, scale_m_s: float = 0.20, phase: str = 'accepted', **kwargs
+):
+    """Bounded horizontal-speed cost throughout a requested jump."""
+    c = jump_v2_update(env)
+    speed = env.scene["robot"].data.root_link_lin_vel_w[:, :2].norm(dim=-1)
+    square = (speed / max(scale_m_s, 1e-6)).square()
+    cost = 4.0 * square / (square + 4.0)
+    return torch.where(c.phase_mask(phase), cost, torch.zeros_like(cost))
+
+
+def jump_upright_cost(env, deadband_deg: float = 2.0,
+                      cap_deg: float = 15.0, phase: str = 'accepted', **kwargs):
+    """Roll/pitch cost; yaw is handled separately by the heading contract."""
+    c = jump_v2_update(env)
+    quat = env.scene["robot"].data.root_link_quat_w
+    cos_tilt = (1.0 - 2.0 * quat[:, 1:3].square().sum(dim=-1)).clamp(-1.0, 1.0)
+    tilt = torch.acos(cos_tilt)
+    excess = (tilt - math.radians(deadband_deg)).clamp_min(0.0)
+    span = max(math.radians(cap_deg - deadband_deg), 1e-6)
+    square = (excess / span).square()
+    cost = 4.0 * square / (square + 4.0)
+    return torch.where(c.phase_mask(phase), cost, torch.zeros_like(cost))
+
+
+def jump_post_landing_pose_cost(
+    env, scale_rad: float = 0.20, phase: str = 'post_contact', **kwargs
+):
+    """Return-to-HOME joint cost, activated only after first touchdown."""
+    c = jump_v2_update(env)
+    asset = env.scene["robot"]
+    error = _servo_joint_pos(env, asset) - _servo_default_joint_pos(env, asset)
+    square = (error / max(scale_rad, 1e-6)).square().mean(dim=-1)
+    cost = 4.0 * square / (square + 4.0)
+    return torch.where(c.phase_mask(phase), cost, torch.zeros_like(cost))
+
+
+def jump_single_foot_support_cost(env, phase: str = 'post_contact', **kwargs):
+    """Penalize asymmetric support after first contact until recovery completes."""
+    c = jump_v2_update(env)
+    feet = _jump_feet_contact(env, 'feet_ground_contact')
+    single = feet.any(dim=-1) & ~feet.all(dim=-1)
+    return torch.where(
+        c.phase_mask(phase), single.float(), torch.zeros(env.num_envs, device=env.device)
+    )
+
+
+def jump_launch_action_symmetry_cost(
+    env, scale_rad: float = 0.20, phase: str = 'launch', **kwargs
+):
+    """Self-mirror action cost during the configured dynamic phase."""
+    c = jump_v2_update(env)
+    actions = env.action_manager.action
+    from mjlab_microduck.tasks.symmetry import microduck_mirror_actions
+    residual = actions - microduck_mirror_actions(actions)
+    square = (residual / max(scale_rad, 1e-6)).square().mean(dim=-1)
+    cost = 4.0 * square / (square + 4.0)
+    return torch.where(c.phase_mask(phase), cost, torch.zeros_like(cost))
+
+
+def jump_success_score(env, **kwargs):
+    return jump_v2_reward(env, 'success_event')
+
+
+def jump_success_metric(env, **kwargs):
+    return jump_controller(env).complete.float().clone()
+
+
+def jump_peak_height_metric(env, **kwargs):
+    return jump_controller(env).peak.clone()
+
+
+class JumpRequestCommand(CommandTerm):
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.env = env
+        self.value = torch.zeros(self.num_envs, 3, device=self.device)
+        self.standing_only = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.recovery_only = self.standing_only.clone()
+        self.sent = self.standing_only.clone()
+        self.request_at = torch.zeros(self.num_envs, device=self.device)
+        self.request_times = torch.zeros(self.num_envs, 3, device=self.device)
+        self.request_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.next_request = torch.zeros_like(self.request_count)
+        self.protocol = int(getattr(self.cfg, "protocol", 1))
+        self.policy_version = int(getattr(self.cfg, "policy_version", 3))
+
+    @property
+    def command(self):
+        return self.value
+
+    def _resample_command(self, env_ids):
+        count = len(env_ids)
+        if self.policy_version >= 7:
+            draw = torch.rand(count, device=self.device)
+            recovery = torch.zeros(count, dtype=torch.bool, device=self.device)
+            if self.policy_version >= 8:
+                recovery = draw < self.cfg.recovery_probability
+                standing = ((draw >= self.cfg.recovery_probability)
+                            & (draw < self.cfg.recovery_probability + self.cfg.standing_probability))
+                triple = ((draw >= self.cfg.recovery_probability + self.cfg.standing_probability)
+                          & (draw < self.cfg.recovery_probability + self.cfg.standing_probability + self.cfg.triple_probability))
+            else:
+                standing = draw < self.cfg.standing_probability
+                triple = ((draw >= self.cfg.standing_probability)
+                          & (draw < self.cfg.standing_probability + self.cfg.triple_probability))
+            self.recovery_only[env_ids] = recovery
+            self.standing_only[env_ids] = standing
+            self.request_count[env_ids] = torch.where(
+                standing, torch.zeros_like(draw, dtype=torch.long),
+                torch.where(triple, torch.full_like(draw, 3, dtype=torch.long),
+                            torch.ones_like(draw, dtype=torch.long)),
+            )
+            base = torch.as_tensor(self.cfg.request_times, device=self.device)
+            jitter = ((2.0 * torch.rand(count, 3, device=self.device) - 1.0)
+                      * self.cfg.request_jitter_s)
+            self.request_times[env_ids] = base + jitter
+            self.request_at[env_ids] = self.request_times[env_ids, 0]
+            self.next_request[env_ids] = 0
+            self.sent[env_ids] = standing
+        else:
+            self.recovery_only[env_ids] = False
+            self.standing_only[env_ids] = torch.rand(count, device=self.device) < self.cfg.standing_probability
+            self.request_at[env_ids] = torch.rand(count, device=self.device) + 1
+            self.request_count[env_ids] = (~self.standing_only[env_ids]).long()
+            self.next_request[env_ids] = 0
+            self.sent[env_ids] = False
+        self.value[env_ids] = 0
+
+    def _update_metrics(self):
+        pass
+
+    def _update_command(self):
+        # Rewards already updated terminal states. Newly reset environments have
+        # last_step=current and are skipped until a fresh physical step occurs.
+        c = jump_v2_update(self.env)
+        t = self.env.episode_length_buf * self.env.step_dt
+        xy = self.env.scene["robot"].data.root_link_pos_w[:, :2]
+        if self.policy_version >= 7:
+            active = self.next_request < self.request_count
+            index = self.next_request.clamp(max=2)
+            due_at = self.request_times.gather(1, index[:, None]).squeeze(1)
+            due = active & (t >= due_at)
+            accepted = c.press(due, c.current_yaw, xy)
+            rejected = due & ~accepted
+            if self.policy_version >= 8:
+                c.mark_readiness_failure(rejected)
+            else:
+                c.readiness_failure |= rejected
+            self.next_request[due] += 1
+            self.sent = self.next_request >= self.request_count
+        else:
+            due = (t >= self.request_at) & (t <= 2. + 1e-6) & ~self.standing_only & ~self.sent
+            accepted = c.press(due, c.current_yaw, xy)
+            # Keep a due request pending until the controller has observed a full
+            # stable-support window. This matters under reset noise: an early due
+            # time must not silently erase the only jump sample in an episode.
+            self.sent |= accepted
+            c.readiness_failure |= (t >= 2. - 1e-6) & ~self.standing_only & ~self.sent
+            self.sent |= c.readiness_failure
+        self.value.copy_(c.command(self.protocol))
+
+
+@_dataclass(kw_only=True)
+class JumpRequestCommandCfg(CommandTermCfg):
+    standing_probability: float = .25
+    protocol: int = 1
+    policy_version: int = 3
+    triple_probability: float = 0.0
+    recovery_probability: float = 0.0
+    single_probability: float | None = None
+    target_delta: float = 0.015
+    required_delta: float | None = None
+    request_times: tuple[float, float, float] = (7.0, 14.0, 21.0)
+    request_jitter_s: float = 0.5
+
+    def build(self, env):
+        return JumpRequestCommand(self, env)
+
+
+def jump_v3_failure(env):
+    return jump_v2_update(env).invalid.clone()
+
+
+def jump_v3_critic_state(env):
+    c = jump_v2_update(env)
+    keys = ('request', 'busy', 'accepted', 'took_off', 'landed', 'request_time',
+            'ready_time', 'stable_time', 'paid_height', 'paid_launch', 'peak',
+            'success', 'complete', 'request_timeout', 'readiness_failure')
+    values = [c.state[k].float() for k in keys]
+    values += [(env.max_episode_length - env.episode_length_buf) * env.step_dt,
+               torch.full_like(c.peak, c.target_delta)]
+    return torch.nan_to_num(torch.stack(values, dim=-1))

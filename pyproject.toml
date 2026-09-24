@@ -25,7 +25,7 @@ dependencies = [
     # mjlab 1.3.0 imports scipy (terrains/heightfield_terrains.py) but forgets
     # to declare it — without this line a fresh `uv sync` (e.g. on HF jobs)
     # can't even `import mjlab_microduck` (found 2026-07-21).
-    "scipy>=1.16",
+    "scipy==1.16.1",
     # Direct dep ONLY so [tool.uv.sources] can bind torch to the CUDA index on
     # aarch64 (see the torch source below) — uv applies sources to DIRECT
     # dependencies only, so as a purely transitive dep (mjlab, rsl_rl) the

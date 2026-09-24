@@ -1230,7 +1230,22 @@ def main():
                              "simulated legs (perfect IMU) and print each set's error against the "
                              "true trunk pose every second and at exit. Drives the robot around to "
                              "compare drift; combine with --odom-anchor-points to see each anchor.")
+    parser.add_argument('--jump', help='Standalone 61D jump ONNX; J requests one jump, P pushes')
+    parser.add_argument('--headless', action='store_true', help='CPU jump rehearsal without viewer')
+    parser.add_argument('--seconds', type=float, default=20., help='Headless jump rehearsal duration')
+    parser.add_argument('--jump-at', type=float, nargs='*', default=[], help='Reproduce J presses at these simulation seconds')
+    parser.add_argument('--stand-z', type=float, default=None, help='Measured closed-loop standing height')
+    parser.add_argument('--json-out', help='Jump rehearsal trace JSON')
+    parser.add_argument('--video-out', help='Uncut CPU BAM replay video')
     args = parser.parse_args()
+    if args.jump:
+        if any((args.walking, args.standing, args.sitstand, args.ground_pick, args.sit,
+                args.slope, args.kick_left, args.kick_right, args.roulade, args.roller)):
+            parser.error('--jump is a standalone mode')
+        from jump_rehearsal import run
+        run(args)
+        return
+
 
     if not args.walking and not args.standing and not args.sitstand:
         parser.error("At least one of --walking, --standing or --sitstand must be provided")

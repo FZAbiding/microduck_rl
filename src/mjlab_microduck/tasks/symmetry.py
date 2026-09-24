@@ -101,13 +101,23 @@ _cache: dict[torch.device, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch
 def _get_tensors(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if device not in _cache:
-        obs_perm = torch.tensor(_OBS_PERM, dtype=torch.long, device=device)
-        obs_sign = torch.tensor(_OBS_SIGN, dtype=torch.float32, device=device)
-        act_perm = torch.tensor(_JOINT_PERM, dtype=torch.long, device=device)
-        act_sign = torch.tensor(_JOINT_SIGN, dtype=torch.float32, device=device)
-        _cache[device] = (obs_perm, obs_sign, act_perm, act_sign)
+    cached = _cache.get(device)
+    if cached is None or any(torch.is_inference(value) for value in cached):
+        with torch.inference_mode(False):
+            obs_perm = torch.tensor(_OBS_PERM, dtype=torch.long, device=device)
+            obs_sign = torch.tensor(_OBS_SIGN, dtype=torch.float32, device=device)
+            act_perm = torch.tensor(_JOINT_PERM, dtype=torch.long, device=device)
+            act_sign = torch.tensor(_JOINT_SIGN, dtype=torch.float32, device=device)
+            _cache[device] = (obs_perm, obs_sign, act_perm, act_sign)
     return _cache[device]
+
+
+def microduck_mirror_actions(actions: torch.Tensor) -> torch.Tensor:
+    """Return the left/right reflection of one 14-D Microduck action batch."""
+    if actions.ndim != 2 or actions.shape[1] != 14:
+        raise ValueError("Microduck action symmetry requires shape [B, 14]")
+    _, _, act_perm, act_sign = _get_tensors(actions.device)
+    return actions[:, act_perm] * act_sign
 
 
 # ---------------------------------------------------------------------------
@@ -162,8 +172,7 @@ def microduck_vel_symmetry(
         )
 
     if actions is not None:
-        _, _, act_perm, act_sign = _get_tensors(actions.device)
-        actions_sym = actions[:, act_perm] * act_sign
+        actions_sym = microduck_mirror_actions(actions)
         aug_actions = torch.cat([actions, actions_sym], dim=0)
 
     return aug_obs, aug_actions
