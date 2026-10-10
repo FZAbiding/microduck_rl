@@ -38,12 +38,36 @@ def command_protocol(metadata: dict[str, str] | None) -> int:
         return 1
 
 
+def jump_pose_metrics(names, positions, defaults, foot_quaternions):
+    """Shared CPU/GPU measurements; positions must use the policy's servo view.
+
+    Feet are ordered left/right, quaternions wxyz. The sole sites have symmetric
+    five-degree HOME roll; pitch is measured against the ground plane.
+    """
+    names = tuple(names)
+    legs = [names.index(f'{side}_{joint}') for side in ('left', 'right')
+            for joint in ('hip_yaw', 'hip_roll', 'hip_pitch', 'knee', 'ankle')]
+    ankles = [names.index(f'{side}_ankle') for side in ('left', 'right')]
+    error = (positions - defaults).abs()
+    w, x, y, z = foot_quaternions.unbind(-1)
+    roll = torch.atan2(2 * (w*x + y*z), 1 - 2 * (x*x + y*y))
+    pitch = torch.asin((2 * (w*y - z*x)).clamp(-1, 1))
+    return dict(
+        joint_l1=error[..., legs].mean(-1),
+        joint_max=error[..., legs].amax(-1),
+        ankle_max=error[..., ankles].amax(-1),
+        foot_pitch_max=pitch.abs().amax(-1),
+        foot_roll_max=(roll.abs() - math.radians(5)).clamp_min(0).amax(-1),
+    )
+
+
 class JumpController:
     def __init__(self, n, device='cpu', dt=.02, stand_z=.115, target_delta=.015,
                  required_delta=None, policy_version=3):
         self.n, self.device, self.dt = n, device, dt
         self.stand_z, self.target_delta = stand_z, target_delta
         self.policy_version = int(policy_version)
+        self.strict_first_request = True
         # None is part of the backwards-compatibility contract: v3/v4
         # checkpoints predate this field and retain their historical 5 mm
         # acceptance margin. V5 always stores an explicit exact value.
@@ -67,6 +91,11 @@ class JumpController:
         for key in ('readiness_failure_event', 'recovery_timeout_event'):
             self.state[key] = torch.zeros(n, device=device)
         self.state['target_xy'] = torch.zeros(n, 2, device=device)
+        # V9-only state stays out of the legacy critic observation contract.
+        self.state['recovery_only'] = torch.zeros(n, dtype=torch.bool, device=device)
+        self.state['recovery_complete'] = torch.zeros(n, dtype=torch.bool, device=device)
+        self.state['recovery_complete_event'] = torch.zeros(n, device=device)
+        self.state['pending_rejection'] = torch.zeros(n, device=device)
         self.state['air_steps'] = torch.zeros(n, dtype=torch.long, device=device)
         self.last_step = torch.full((n,), -1, dtype=torch.long, device=device)
         self.reset(torch.arange(n, device=device))
@@ -122,6 +151,8 @@ class JumpController:
         accepted = (pressed & ~self.busy
                     & (self.ready_time >= self.ready_duration - 1e-4)
                     & ~self.invalid)
+        if self.policy_version >= 9:
+            accepted &= ~self.recovery_only
         for key in ('took_off', 'landed', 'impact_paid', 'success', 'complete', 'request_timeout', 'recovery_timeout'):
             self.state[key][accepted] = False
         for key in ('stable_time', 'request_time', 'peak', 'air_steps', 'paid_launch', 'paid_height', 'recovery_time'):
@@ -146,6 +177,20 @@ class JumpController:
         fresh = rejected
         self.readiness_failure |= rejected
         self.readiness_failure_event[fresh] = 1.0
+        if self.policy_version >= 9:
+            self.pending_rejection[rejected] += 1.0
+
+    def start_recovery(self, ids, yaw, xy):
+        """Recovery-only starts after landing without fabricating a jump peak."""
+        self.recovery_only[ids] = True
+        self.accepted[ids] = True
+        self.busy[ids] = True
+        self.landed[ids] = True
+        self.impact_paid[ids] = True
+        self.settle_hold[ids] = True
+        self.target_yaw[ids] = yaw
+        self.current_yaw[ids] = yaw
+        self.target_xy[ids] = xy
 
     def command(self, protocol=JUMP_COMMAND_PROTOCOL):
         """Return the shared twist=[request, 0, heading-error] command."""
@@ -158,6 +203,10 @@ class JumpController:
     def update(self, step, z, quat, vz, omega_xy, feet, body, force,
                joint_l1=None, horizontal_speed=None, joint_max=None,
                ankle_max=None, foot_pitch_max=None, foot_roll_max=None):
+        if self.policy_version >= 9 and any(value is None for value in (
+                joint_l1, horizontal_speed, joint_max, ankle_max,
+                foot_pitch_max, foot_roll_max)):
+            raise ValueError('V9 requires all physical readiness measurements')
         active = self.last_step != step
         if not active.any():
             return
@@ -190,6 +239,10 @@ class JumpController:
                     'success_event', 'complete_event', 'failure_event', 'timeout_event',
                     'readiness_failure_event', 'recovery_timeout_event'):
             self.state[key][active] = 0
+        if self.policy_version >= 9:
+            self.recovery_complete_event[active] = 0
+            self.readiness_failure_event[active] = self.pending_rejection[active]
+            self.pending_rejection[active] = 0
         self.failure_event[active & bad & ~self.invalid] = 1.
         self.nan |= active & ~finite
         self.fallen |= active & (body | (cos_tilt < math.cos(math.radians(tilt_limit_deg))))
@@ -229,6 +282,8 @@ class JumpController:
                            & (cos_tilt >= math.cos(math.radians(15.0)))
                            & (vz.abs() <= .05) & (omega_xy.norm(dim=-1) <= .5))
             stable = torch.where(self.accepted, repeated_ready, first_ready)
+            if self.policy_version >= 9 and self.strict_first_request:
+                stable = repeated_ready
         else:
             stable = (safe & feet.all(-1) & ((z - self.stand_z).abs() <= .01)
                       & (cos_tilt >= math.cos(math.radians(15))) & (vz.abs() <= .05)
@@ -265,6 +320,8 @@ class JumpController:
         self.stable_time[active] = torch.where(self.landed & stable, self.stable_time + self.dt, 0)[active]
         if self.policy_version >= 8:
             recovering = active & self.landed & ~self.complete
+            if self.policy_version >= 9:
+                recovering &= ~self.recovery_complete & ~self.invalid
             self.recovery_time[active] = torch.where(
                 recovering, self.recovery_time + self.dt, self.recovery_time
             )[active]
@@ -286,6 +343,15 @@ class JumpController:
                         & (self.stable_time >= self.completion_duration - 1e-4)
                         & ~self.complete & safe)
             self.success_event[success] = 1.
+        if self.policy_version >= 9:
+            in_time = ~self.recovery_timeout & ~self.request_timeout
+            success &= ~self.recovery_only & in_time
+            complete &= ~self.recovery_only & in_time
+            recovered = (active & self.recovery_only & safe
+                         & (self.stable_time >= self.completion_duration - 1e-4)
+                         & ~self.recovery_complete & in_time)
+            self.recovery_complete_event[recovered] = 1.
+            self.recovery_complete |= recovered
         self.complete_event[complete] = 1.
         self.success |= success
         self.complete |= complete

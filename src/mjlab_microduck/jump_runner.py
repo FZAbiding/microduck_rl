@@ -149,8 +149,8 @@ class JumpRunner(MjlabOnPolicyRunner):
                 raise ValueError('V5+ checkpoint requires protocol 2 and an exact height gate')
         if checkpoint_format == 'microduck-jump-v7' and c.policy_version != 7:
             raise ValueError('V7 checkpoint requires the V7 recovery controller')
-        if checkpoint_format == 'microduck-jump-v8' and (
-                c.policy_version != 8 or abs(c.target_delta - .032) > 1e-9
+        if checkpoint_format in ('microduck-jump-v8', 'microduck-jump-v9') and (
+                c.policy_version != int(checkpoint_format.rsplit('v', 1)[-1]) or abs(c.target_delta - .032) > 1e-9
                 or c.required_delta is None or abs(c.required_delta - .030) > 1e-9):
             raise ValueError('V8 checkpoint requires the 3.2 cm / exact 3.0 cm contract')
         data = self.alg.save()
@@ -200,6 +200,11 @@ class JumpRunner(MjlabOnPolicyRunner):
             )
         if c.required_delta is not None:
             metadata['jump_required_delta'] = str(c.required_delta)
+        if policy_version >= 9:
+            metadata.update(jump_measurement_contract='9', jump_ready_joint_max_rad='.10',
+                            jump_ready_ankle_max_rad='.06', jump_ready_foot_pitch_deg='3',
+                            jump_ready_foot_roll_excess_deg='3', jump_recovery_timeout_s='8',
+                            jump_strict_first_request=str(c.strict_first_request).lower())
         onnx.helper.set_model_props(model, metadata)
         onnx.save(model, str(Path(path)/filename))
 
@@ -207,7 +212,7 @@ class JumpRunner(MjlabOnPolicyRunner):
         data = torch.load(path, weights_only=False, map_location=map_location or self.device)
         if data.get('format') not in ('microduck-jump-v3', 'microduck-jump-v4',
                                       'microduck-jump-v5', 'microduck-jump-v6',
-                                      'microduck-jump-v7', 'microduck-jump-v8'):
+                                      'microduck-jump-v7', 'microduck-jump-v8', 'microduck-jump-v9'):
             raise ValueError('Unsupported jump checkpoint format')
         self.alg.load(data, load_cfg, strict)
         self.current_learning_iteration = data['completed_updates']
@@ -224,9 +229,9 @@ class JumpRunner(MjlabOnPolicyRunner):
                     or float(recovery.get('ready_duration_s', 0.0)) != 2.0
                     or float(recovery.get('completion_duration_s', 0.0)) != 5.0):
                 raise ValueError('Invalid V7 recovery controller contract')
-        if data.get('format') == 'microduck-jump-v8':
+        if data.get('format') in ('microduck-jump-v8', 'microduck-jump-v9'):
             recovery = state.get('recovery_contract', {})
-            if (int(state.get('policy_version', 0)) != 8
+            if (int(state.get('policy_version', 0)) != int(data['format'].rsplit('v', 1)[-1])
                     or abs(float(state.get('target_delta', 0.0)) - .032) > 1e-9
                     or abs(float(state.get('required_delta', 0.0)) - .030) > 1e-9
                     or float(recovery.get('ready_duration_s', 0.0)) != 2.0

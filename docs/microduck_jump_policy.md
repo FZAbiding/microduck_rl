@@ -128,3 +128,13 @@ uv run scripts/evaluate_jump.py --checkpoint-file <v7.pt> \
 监督器会在连续两个 250-update 边界都通过后，自动复测 seeds 123/124/125，
 再走标准 normalizer-baked ONNX 导出、`[1,61] -> [1,14]` 误差检查和 30 秒
 CPU BAM 7/14/21 秒三跳回放。只有这些门全部通过，状态才会写为 `passed`。
+
+
+## Jump-V9：严格恢复修复与低噪声诊断
+
+V9 修复关节/脚姿态测量、纯恢复事件、超时完成和监督续训，并保持 61→14、
+50 Hz、BAM 与 normalizer-baked ONNX。当前未通过连续跳跃验收；保留 A6425
+诊断候选，后续低噪声 A6475 因退化已回滚，累计新增 165 update。
+
+策略、奖励、结果和复现命令见 [V9 总结报告](microduck_jump_v9_report.md)；
+过程见 [V9 执行记录](microduck_jump_v9_execution.md)。

@@ -27,13 +27,13 @@ checkpoint_format=d.get('format', 'unknown')
 metadata_passed=True
 expected={}
 if checkpoint_format in ('microduck-jump-v5', 'microduck-jump-v6',
-                         'microduck-jump-v7'):
+                         'microduck-jump-v7', 'microduck-jump-v8', 'microduck-jump-v9'):
     version=checkpoint_format.rsplit('v',1)[-1]
     contract=d['infos']['jump_transfer']
     expected={'jump_policy_version':version,'jump_command_protocol':'2',
               'jump_target_delta':str(contract['target_delta']),
               'jump_required_delta':str(contract['required_delta'])}
-    if checkpoint_format == 'microduck-jump-v7':
+    if int(version) >= 7:
         expected.update({
             'jump_ready_duration_s': '2.0',
             'jump_recovery_duration_s': '5.0',
@@ -43,8 +43,15 @@ if checkpoint_format in ('microduck-jump-v5', 'microduck-jump-v6',
             'jump_ready_yaw_rate_rad_s': '0.1',
             'jump_failure_tilt_deg': '45.0',
         })
-    metadata_passed=(contract.get('required_delta') is not None
-                     and abs(contract['required_delta']-contract['target_delta'])<=1e-9
+    if int(version) >= 9:
+        expected.update(jump_measurement_contract='9', jump_ready_joint_max_rad='.10',
+                        jump_ready_ankle_max_rad='.06', jump_ready_foot_pitch_deg='3',
+                        jump_ready_foot_roll_excess_deg='3', jump_recovery_timeout_s='8',
+                        jump_strict_first_request=str(contract['run'].get('strict_first_request', True)).lower())
+    height_valid = (abs(contract['required_delta']-.030) <= 1e-9
+                    and abs(contract['target_delta']-.032) <= 1e-9) if int(version) >= 8 else (
+                        abs(contract['required_delta']-contract['target_delta']) <= 1e-9)
+    metadata_passed=(contract.get('required_delta') is not None and height_valid
                      and all(key in metadata for key in expected)
                      and metadata.get('jump_policy_version')==version
                      and metadata.get('jump_command_protocol')=='2'

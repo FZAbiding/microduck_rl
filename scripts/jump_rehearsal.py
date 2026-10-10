@@ -93,11 +93,20 @@ def run(args):
             data.qpos[policy.joint_qpos_indices] - policy.default_pose
         )))
         horizontal_speed = float(np.linalg.norm(data.qvel[va:va+2]))
+        metrics = dict(joint_l1=tensor(joint_l1), horizontal_speed=tensor(horizontal_speed))
+        if policy_version >= 9:
+            from mjlab_microduck.jump_control import jump_pose_metrics
+            names = [model.joint(int(np.flatnonzero(model.jnt_qposadr == address)[0])).name
+                     for address in policy.joint_qpos_indices]
+            foot_quats = np.zeros((2, 4))
+            for i, name in enumerate(('left_foot', 'right_foot')):
+                mujoco.mju_mat2Quat(foot_quats[i], data.site_xmat[model.site(name).id])
+            metrics.update(jump_pose_metrics(names, tensor(data.qpos[policy.joint_qpos_indices]),
+                                             tensor(policy.default_pose), tensor(foot_quats)))
         c.update(
             step, tensor(z), tensor(quat), tensor(data.qvel[va+2]),
             tensor(data.qvel[va+3:va+6]), tensor(feet, torch.bool),
-            tensor(body, torch.bool), tensor(force), tensor(joint_l1),
-            tensor(horizontal_speed),
+            tensor(body, torch.bool), tensor(force), **metrics,
         )
         return z, tilt, feet, body
     sample_controller(0)
@@ -153,6 +162,12 @@ def run(args):
                     'peak': c.peak.item(), 'complete': c.complete.item(), 'impact': c.impact.item(),
                     'heading_error_rad': float(c.heading_error.item()), 'yaw_rate_rad_s': float(c.yaw_rate.item()),
                     'head_joint_error_rad': head_err, 'vz': float(data.qvel[va+2]), 'omega_xy': data.qvel[va+3:va+6].tolist()})
+                if policy_version >= 9:
+                    trace[-1].update({name: float(getattr(c, name).item()) for name in (
+                        'joint_l1', 'joint_max', 'ankle_max', 'foot_pitch_max', 'foot_roll_max',
+                        'horizontal_speed', 'ready_time', 'stable_time', 'recovery_time')})
+                    trace[-1].update(busy=bool(c.busy.item()), recovery_timeout=bool(c.recovery_timeout.item()),
+                                     root_xy=data.qpos[qa:qa+2].tolist())
                 # Calibrate the natural standing height before the first
                 # scheduled request; accepted stays latched for the episode.
                 if .5 <= (step+1)*.02 < 1.2 and not c.request.item() and feet.all() and tilt <= 15 and not body:
@@ -182,6 +197,10 @@ def run(args):
         'complete': c.complete.item(), 'natural_stand_z': float(np.median(height_window)) if height_window else None,
         'initial_standing_passed': all(r['tilt_deg']<=15 and not r['body_contact'] for r in trace if r['time']<=10.),
         'trace': trace, 'successful_requests': successful_requests, 'maneuvers': maneuver_results}
+    if policy_version >= 9:
+        result.update(measurement_contract=9, strict_first_request=True,
+                      recovery_timeout=any(r['recovery_timeout'] for r in trace),
+                      busy=bool(c.busy.item()))
     if args.json_out:
         Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.json_out).write_text(json.dumps(result, indent=2)+'\n')

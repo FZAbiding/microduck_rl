@@ -7459,9 +7459,14 @@ def jump_foot_pose_cost(
 ) -> torch.Tensor:
     """Positive foot-flat cost; configure it with a negative reward weight."""
     c = jump_v2_update(env)
-    pitch, roll = _jump_foot_posture_errors(env, env.scene["robot"])
-    error = torch.maximum(pitch, roll).amax(dim=-1)
+    if c.policy_version >= 9:
+        error = torch.maximum(c.foot_pitch_max, c.foot_roll_max)
+    else:
+        pitch, roll = _jump_foot_posture_errors(env, env.scene["robot"])
+        error = torch.maximum(pitch, roll).amax(dim=-1)
     cost = (error / max(scale_rad, 1e-6)).square()
+    if c.policy_version >= 9:
+        cost = cost.clamp(max=4.0)
     return torch.where(c.phase_mask(phase), cost, torch.zeros_like(cost))
 
 
@@ -7477,6 +7482,10 @@ def jump_robust_leg_home_cost(
     legs = torch.stack((error[:, :5], error[:, 9:14]), dim=1)
     p4 = (legs.pow(4).mean(dim=-1)).pow(0.25).amax(dim=-1)
     cost = (p4 / max(scale_rad, 1e-6)).square()
+    if c.policy_version >= 9:
+        # Reuse the named-leg measurement, including both actual ankles.
+        error = jump_v9_measurements(env)['joint_max']
+        cost = (error / max(scale_rad, 1e-6)).square().clamp(max=4.0)
     return torch.where(c.phase_mask(phase), cost, torch.zeros_like(cost))
 
 
@@ -7489,6 +7498,8 @@ def jump_touchdown_displacement_cost(
     position = env.scene["robot"].data.root_link_pos_w[:, :2]
     error = (position - c.target_xy).norm(dim=-1) / max(scale_m, 1e-6)
     cost = 4.0 * error.square() / (error.square() + 4.0)
+    if c.policy_version >= 9:
+        cost = cost / env.step_dt
     return torch.where(c.impact > 0.0, cost, torch.zeros_like(cost))
 
 
@@ -7563,17 +7574,38 @@ def jump_v2_update(env):
     joint_l1 = joint_error.abs().mean(dim=-1)
     foot_pitch_error, foot_roll_error = _jump_foot_posture_errors(env, asset)
     horizontal_speed = asset.data.root_link_lin_vel_w[:, :2].norm(dim=-1)
+    metrics = dict(joint_l1=joint_l1, horizontal_speed=horizontal_speed,
+                   joint_max=joint_error.abs().amax(dim=-1),
+                   ankle_max=joint_error[:, (4, 9)].abs().amax(dim=-1),
+                   foot_pitch_max=foot_pitch_error, foot_roll_max=foot_roll_error)
+    if c.policy_version >= 9:
+        metrics = jump_v9_measurements(env)
     c.update(int(env.common_step_counter), asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2],
              asset.data.root_link_quat_w, asset.data.root_link_lin_vel_w[:, 2],
              asset.data.root_link_ang_vel_b,
              _jump_feet_contact(env, 'feet_ground_contact'),
              _jump_any_contact(env, 'body_ground_contact'), force,
-             joint_l1=joint_l1, horizontal_speed=horizontal_speed,
-             joint_max=joint_error.abs().amax(dim=-1),
-             ankle_max=joint_error[:, (4, 9)].abs().amax(dim=-1),
-             foot_pitch_max=foot_pitch_error,
-             foot_roll_max=foot_roll_error)
+             **metrics)
     return c
+
+
+def jump_v9_measurements(env):
+    """Strict physical measurements shared with the V9 evaluator."""
+    from mjlab_microduck.jump_control import jump_pose_metrics
+    asset = env.scene['robot']
+    ids = _servo_joint_ids(env, asset)
+    names = [asset.joint_names[i] for i in ids]
+    sites = [asset.site_names.index(name) for name in ('left_foot', 'right_foot')]
+    positions = _servo_joint_pos(env, asset).clone()
+    # Match the output-side encoder view used by backlash policies.
+    for i, name in enumerate(names):
+        passive = f'passive_{name}_backlash'
+        if passive in asset.joint_names:
+            positions[:, i] += asset.data.joint_pos[:, asset.joint_names.index(passive)]
+    metrics = jump_pose_metrics(names, positions, _servo_default_joint_pos(env, asset),
+                                asset.data.site_quat_w[:, sites])
+    metrics['horizontal_speed'] = asset.data.root_link_lin_vel_w[:, :2].norm(dim=-1)
+    return metrics
 
 
 def set_random_jump_recovery_state(
@@ -7581,6 +7613,7 @@ def set_random_jump_recovery_state(
     env_ids: torch.Tensor,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
     z_center: float = 0.11581382155418396,
+    noise_scale: float = 1.0,
 ) -> None:
     """Sample a V8 reverse-curriculum recovery state near HOME."""
     if env_ids is None or len(env_ids) == 0:
@@ -7590,27 +7623,49 @@ def set_random_jump_recovery_state(
     servo = _servo_joint_ids(env, asset)
     joints = asset.data.default_joint_pos[ids].clone()
     noise = (torch.rand((len(ids), len(servo)), device=env.device) * 2 - 1) * 0.12
-    joints[:, servo] += noise
+    joints[:, servo] += noise * noise_scale
     names = tuple(asset.joint_names)
     for name, magnitude in (("left_hip_pitch", .12), ("right_hip_pitch", .12),
                             ("left_ankle", .06), ("right_ankle", .06)):
         if name in names:
             j = names.index(name)
             sign = 1.0 if name.startswith("left_") else -1.0
-            joints[:, j] += sign * (torch.rand(len(ids), device=env.device) * 2 - 1) * magnitude
+            joints[:, j] += sign * (torch.rand(len(ids), device=env.device) * 2 - 1) * magnitude * noise_scale
     env.sim.data.qpos[ids, 7:] = joints
-    roll = (torch.rand(len(ids), device=env.device) * 2 - 1) * math.radians(8)
-    pitch = (torch.rand(len(ids), device=env.device) * 2 - 1) * math.radians(8)
+    roll = (torch.rand(len(ids), device=env.device) * 2 - 1) * math.radians(8) * noise_scale
+    pitch = (torch.rand(len(ids), device=env.device) * 2 - 1) * math.radians(8) * noise_scale
     yaw = (torch.rand(len(ids), device=env.device) * 2 - 1) * math.pi
     cy, sy = torch.cos(yaw / 2), torch.sin(yaw / 2)
     cp, sp = torch.cos(pitch / 2), torch.sin(pitch / 2)
     cr, sr = torch.cos(roll / 2), torch.sin(roll / 2)
     quat = torch.stack((cr*cp*cy + sr*sp*sy, sr*cp*cy - cr*sp*sy,
                         cr*sp*cy + sr*cp*sy, cr*cp*sy - sr*sp*cy), dim=-1)
-    env.sim.data.qpos[ids, 2] = z_center + (torch.rand(len(ids), device=env.device) * 2 - 1) * .005
+    env.sim.data.qpos[ids, 2] = z_center + (torch.rand(len(ids), device=env.device) * 2 - 1) * .005 * noise_scale
     env.sim.data.qpos[ids, 3:7] = quat
-    env.sim.data.qvel[ids, 0:2] = (torch.rand((len(ids), 2), device=env.device) * 2 - 1) * .12
-    env.sim.data.qvel[ids, 3:6] = (torch.rand((len(ids), 3), device=env.device) * 2 - 1) * .5
+    env.sim.data.qvel[ids, 0:2] = (torch.rand((len(ids), 2), device=env.device) * 2 - 1) * .12 * noise_scale
+    env.sim.data.qvel[ids, 3:6] = (torch.rand((len(ids), 3), device=env.device) * 2 - 1) * .5 * noise_scale
+
+
+def jump_v9_reset(env, env_ids):
+    """Sample once before physics reset, then reuse at command-manager reset."""
+    from mjlab_microduck.jump_control import yaw_from_quat
+    c = jump_controller(env)
+    command = env.command_manager.get_term('twist')
+    command._v9_reset_sampled[env_ids] = False
+    command._resample_command(env_ids)
+    command._v9_reset_sampled[env_ids] = True
+    c.reset(env_ids, int(env.common_step_counter))
+    c.strict_first_request = command.cfg.strict_first_request
+    ids = env_ids[command.recovery_only[env_ids]]
+    if len(ids):
+        set_random_jump_recovery_state(env, ids, z_center=c.stand_z,
+                                       noise_scale=command.cfg.recovery_noise_scale)
+        env.sim.data.qpos[ids, 2] += env.scene.terrain.env_origins[ids, 2]
+        c.start_recovery(ids, yaw_from_quat(env.sim.data.qpos[ids, 3:7]),
+                         env.sim.data.qpos[ids, :2])
+    for name in ('_jump_head_bias_ema', '_jump_recovery_potential_valid'):
+        if hasattr(env, name):
+            getattr(env, name)[env_ids] = 0
 
 
 def jump_v8_reset(env, env_ids):
@@ -7812,12 +7867,19 @@ class JumpRequestCommand(CommandTerm):
         self.next_request = torch.zeros_like(self.request_count)
         self.protocol = int(getattr(self.cfg, "protocol", 1))
         self.policy_version = int(getattr(self.cfg, "policy_version", 3))
+        self._v9_reset_sampled = torch.zeros_like(self.standing_only)
 
     @property
     def command(self):
         return self.value
 
     def _resample_command(self, env_ids):
+        if self.policy_version >= 9:
+            skip = self._v9_reset_sampled[env_ids].clone()
+            self._v9_reset_sampled[env_ids] = False
+            env_ids = env_ids[~skip]
+            if not len(env_ids):
+                return
         count = len(env_ids)
         if self.policy_version >= 7:
             draw = torch.rand(count, device=self.device)
@@ -7846,6 +7908,9 @@ class JumpRequestCommand(CommandTerm):
             self.request_at[env_ids] = self.request_times[env_ids, 0]
             self.next_request[env_ids] = 0
             self.sent[env_ids] = standing
+            if self.policy_version >= 9:
+                self.request_count[env_ids[recovery]] = 0
+                self.sent[env_ids[recovery]] = True
         else:
             self.recovery_only[env_ids] = False
             self.standing_only[env_ids] = torch.rand(count, device=self.device) < self.cfg.standing_probability
@@ -7901,6 +7966,8 @@ class JumpRequestCommandCfg(CommandTermCfg):
     required_delta: float | None = None
     request_times: tuple[float, float, float] = (7.0, 14.0, 21.0)
     request_jitter_s: float = 0.5
+    strict_first_request: bool = True
+    recovery_noise_scale: float = 0.25
 
     def build(self, env):
         return JumpRequestCommand(self, env)
