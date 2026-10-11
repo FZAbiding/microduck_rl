@@ -9,6 +9,7 @@ MAX_UPDATES = 4000
 STAGES = {
     # standing, recovery, single, triple; noise; quality weight multiplier
     'pilot': ((.30, .10, .60, .00), .25, .25),
+    'landing_recovery': ((.30, .35, .35, .00), .25, .25),
     'recovery': ((.20, .35, .45, .00), .50, .50),
     'single': ((.20, .20, .60, .00), .50, .50),
     'triple': ((.20, .15, .35, .30), .50, .75),

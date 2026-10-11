@@ -7646,7 +7646,57 @@ def set_random_jump_recovery_state(
     env.sim.data.qvel[ids, 3:6] = (torch.rand((len(ids), 3), device=env.device) * 2 - 1) * .5 * noise_scale
 
 
-def jump_v9_reset(env, env_ids):
+def set_jump_landing_bank_state(env, env_ids, path, max_joint_error=None):
+    """Restore physical landing states; schema2 action/yaw history is deferred to command reset."""
+    from mjlab_microduck.jump_landing_bank import load_bank
+    cache = getattr(env, '_jump_landing_bank', None)
+    if cache is None or cache['path'] != str(path) or cache['max_joint_error'] != max_joint_error:
+        arrays, metadata = load_bank(path, env.scene['robot'].joint_names,
+                                    env.sim.data.qpos.shape[1], env.sim.data.qvel.shape[1])
+        if max_joint_error is not None:
+            if not math.isfinite(max_joint_error) or max_joint_error <= 0:
+                raise ValueError('invalid landing bank frontier')
+            keep = arrays['joint_max'] <= max_joint_error
+            arrays = {k: v[keep] for k, v in arrays.items()}
+            if not len(arrays['qpos']):
+                raise ValueError('landing bank frontier has no samples')
+        cache = dict(path=str(path), metadata=metadata, max_joint_error=max_joint_error,
+                     arrays={k: torch.as_tensor(v, device=env.device) for k,v in arrays.items()},
+                     qpos=torch.as_tensor(arrays['qpos'], device=env.device),
+                     qvel=torch.as_tensor(arrays['qvel'], device=env.device))
+        env._jump_landing_bank = cache
+    selected = torch.randint(len(cache['qpos']), (len(env_ids),), device=env.device)
+    qpos = cache['qpos'][selected].clone()
+    qpos[:, :3] += env.scene.terrain.env_origins[env_ids]
+    env.sim.data.qpos[env_ids] = qpos.to(env.sim.data.qpos)
+    env.sim.data.qvel[env_ids] = cache['qvel'][selected].to(env.sim.data.qvel)
+    if 'action' in cache['arrays']:
+        if not hasattr(env, '_jump_landing_history_pending'):
+            env._jump_landing_history_pending = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+            env._jump_landing_rows = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        env._jump_landing_history_pending[env_ids] = True
+        env._jump_landing_rows[env_ids] = selected
+
+
+def restore_jump_landing_history(env, env_ids):
+    """Called by command reset AFTER action-manager reset; partial resets stay local."""
+    if not hasattr(env, '_jump_landing_history_pending'):
+        return
+    ids = env_ids[env._jump_landing_history_pending[env_ids]]
+    if not len(ids):
+        return
+    rows = env._jump_landing_rows[ids]
+    arrays = env._jump_landing_bank['arrays']
+    for field in ('action', 'prev_action', 'prev_prev_action'):
+        target = getattr(env.action_manager, '_' + field)
+        target[ids] = arrays[field][rows].to(target)
+    c = jump_controller(env)
+    c.target_yaw[ids] = arrays['target_yaw'][rows].to(c.target_yaw)
+    c.heading_error[ids] = arrays['heading_error'][rows].to(c.heading_error)
+    env._jump_landing_history_pending[ids] = False
+
+
+def jump_v9_reset(env, env_ids, recovery_bank_path=None, recovery_bank_max_joint_error=None):
     """Sample once before physics reset, then reuse at command-manager reset."""
     from mjlab_microduck.jump_control import yaw_from_quat
     c = jump_controller(env)
@@ -7655,12 +7705,17 @@ def jump_v9_reset(env, env_ids):
     command._resample_command(env_ids)
     command._v9_reset_sampled[env_ids] = True
     c.reset(env_ids, int(env.common_step_counter))
+    if hasattr(env, '_jump_landing_history_pending'):
+        env._jump_landing_history_pending[env_ids] = False
     c.strict_first_request = command.cfg.strict_first_request
     ids = env_ids[command.recovery_only[env_ids]]
     if len(ids):
-        set_random_jump_recovery_state(env, ids, z_center=c.stand_z,
-                                       noise_scale=command.cfg.recovery_noise_scale)
-        env.sim.data.qpos[ids, 2] += env.scene.terrain.env_origins[ids, 2]
+        if recovery_bank_path:
+            set_jump_landing_bank_state(env, ids, recovery_bank_path, recovery_bank_max_joint_error)
+        else:
+            set_random_jump_recovery_state(env, ids, z_center=c.stand_z,
+                                           noise_scale=command.cfg.recovery_noise_scale)
+            env.sim.data.qpos[ids, 2] += env.scene.terrain.env_origins[ids, 2]
         c.start_recovery(ids, yaw_from_quat(env.sim.data.qpos[ids, 3:7]),
                          env.sim.data.qpos[ids, :2])
     for name in ('_jump_head_bias_ema', '_jump_recovery_potential_valid'):
@@ -7876,6 +7931,7 @@ class JumpRequestCommand(CommandTerm):
     def _resample_command(self, env_ids):
         if self.policy_version >= 9:
             skip = self._v9_reset_sampled[env_ids].clone()
+            restore_jump_landing_history(self.env, env_ids[skip])
             self._v9_reset_sampled[env_ids] = False
             env_ids = env_ids[~skip]
             if not len(env_ids):

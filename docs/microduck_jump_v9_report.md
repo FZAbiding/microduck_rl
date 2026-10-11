@@ -6,6 +6,8 @@
 
 本报告延续 [V1–V8 报告](microduck_jump_v1_v8_report.md) 的结构，依据本地保存的
 配置、checkpoint、严格评估 JSON、训练奖励积分、ONNX 校验及 CPU BAM 回放。
+本报告训练结果统计截止2026-10-08；后续真实落地诊断与小试见
+[落地恢复记录](microduck_jump_v9_landing_recovery.md)。
 详细过程见 [执行记录](microduck_jump_v9_execution.md)，原始设计见
 [训练前计划](microduck_jump_v9_plan.md)。计划中的阶段与验收目标不代表已经完成。
 

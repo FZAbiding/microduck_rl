@@ -31,6 +31,9 @@ def main():
     parser.add_argument('--learning-rate', type=float, default=5e-5)
     parser.add_argument('--idle-std-scale', type=float, default=1.,
                         help='Absolute multiplier of canonical idle exploration; request noise unchanged')
+    parser.add_argument('--recovery-bank', type=Path, help='Validated physical landing states for recovery-only resets')
+    parser.add_argument('--recovery-bank-max-joint-error', type=float, default=None,
+                        help='Training-only frontier filter; strict ready limits stay unchanged')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--export', action='store_true')
@@ -41,6 +44,9 @@ def main():
         parser.error('block must contain 1..250 updates')
     if not np.isfinite(a.idle_std_scale) or not 0 < a.idle_std_scale <= 1:
         parser.error('idle std scale must be in (0, 1]')
+    if a.recovery_bank_max_joint_error is not None and (not a.recovery_bank
+            or not np.isfinite(a.recovery_bank_max_joint_error) or a.recovery_bank_max_joint_error <= 0):
+        parser.error('frontier requires bank and a finite positive max joint error')
     if sha256(a.resume) != a.parent_sha256:
         parser.error('parent SHA256 mismatch')
     if a.output.exists():
@@ -49,6 +55,11 @@ def main():
     source = snapshot(a.output/'source')
     cfg = configure_v9(make_microduck_jump_env_cfg(nominal_bootstrap=False, command_protocol=2),
                        a.stage, strict_first_request=not a.warm_first_request)
+    if a.stage == 'landing_recovery' and not a.recovery_bank:
+        parser.error('landing_recovery requires a physical landing bank')
+    if a.recovery_bank:
+        cfg.events['jump_reset_state'].params.update(recovery_bank_path=str(a.recovery_bank),
+            recovery_bank_max_joint_error=a.recovery_bank_max_joint_error)
     cfg.seed = a.seed
     cfg.scene.num_envs = a.num_envs
     cfg.sim.nan_guard.enabled = True
@@ -87,7 +98,10 @@ def main():
             command_protocol=2, stage=a.stage, parent_checkpoint=str(a.resume),
             parent_sha256=a.parent_sha256, source=source,
             strict_first_request=c.strict_first_request, learning_rate=a.learning_rate,
-            idle_std_scale=a.idle_std_scale, actual_idle_std=idle_std)
+            idle_std_scale=a.idle_std_scale, actual_idle_std=idle_std,
+            recovery_bank=(dict(path=str(a.recovery_bank), sha256=sha256(a.recovery_bank),
+                                max_joint_error=a.recovery_bank_max_joint_error)
+                           if a.recovery_bank else None))
         terms = list(env.reward_manager.active_terms)
         masses = torch.zeros(len(terms), device=env.device)
         sample_steps = 0

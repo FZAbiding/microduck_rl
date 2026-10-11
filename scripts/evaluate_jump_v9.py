@@ -16,10 +16,12 @@ def main():
     p.add_argument('--json-out', required=True)
     p.add_argument('--trace-out')
     p.add_argument('--video-out')
+    p.add_argument('--landing-bank-out', help='Collect safe post-landing physical states during single evaluation')
+    p.add_argument('--recovery-bank', help='Use a physical landing bank for recovery evaluation')
     p.add_argument('--long-interval', action='store_true')
     a = p.parse_args()
     result = evaluate(a.checkpoint, a.episodes, a.seed, a.device, a.sequence,
-                      a.trace_out, a.video_out, a.long_interval)
+                      a.trace_out, a.video_out, a.long_interval, a.landing_bank_out, a.recovery_bank)
     atomic_json(a.json_out, result)
     print(json.dumps({k: v for k, v in result.items() if k != 'records'}, indent=2))
 

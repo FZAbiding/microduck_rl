@@ -143,3 +143,13 @@ B 继续保留其回滚父模型。本轮未继续扩大当前配方，state 标
 没有后台训练进程。模型、视频与训练原始产物保留本地；代码与文档的同步情况以 Git 历史为准。
 
 版本总结及用户 CPU BAM 回放诊断已整理至 [V9 总结报告](microduck_jump_v9_report.md)。
+
+## 2026-10-11：真实落地恢复小试结束
+
+详见 [落地恢复记录](microduck_jump_v9_landing_recovery.md)。新增5-update smoke和
+50-update训练，完成/预留预算220/4000。A-landing-0050的严格standing/single/triple/
+合成recovery为100%/29%/7%/100%；留出落地恢复92%→94%，低于预设+5个百分点。
+CPU 7/17/27秒请求均接受并完成，但末段漂移8.66 cm超过1 cm验收要求。
+因此不扩大该配方，state=diagnose，A活动/最佳模型保留A6425，新候选留作对照。
+本轮完整CPU回归303 passed、1 skipped；额外高度边界测试5 passed；标准ONNX校验通过。
+下一轮应先定位高度裕量和水平漂移，不能仅凭“恢复超时”断言姿态失败。
